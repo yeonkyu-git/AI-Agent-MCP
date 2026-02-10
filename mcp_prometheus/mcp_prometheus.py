@@ -30,6 +30,9 @@ load_dotenv()
 DEFAULT_PROM_URL = os.environ.get("PROM_URL", "").rstrip("/")
 PROM_BEARER_TOKEN = os.environ.get("PROM_BEARER_TOKEN", "")
 HTTP_TIMEOUT_SEC = float(os.environ.get("PROM_TIMEOUT_SEC", "15"))
+ALERT_WARN_PCT = float(os.environ.get("ALERT_WARN_PCT", "85"))
+ALERT_CRIT_PCT = float(os.environ.get("ALERT_CRIT_PCT", "95"))
+ALERT_SUSTAIN_MINUTES = int(os.environ.get("ALERT_SUSTAIN_MINUTES", "5"))
 
 ENV_URLS: Dict[str, str] = {}
 _ENV_URLS_RAW = os.environ.get("PROM_ENV_URLS", "").strip()
@@ -225,6 +228,25 @@ def _parse_step(step: str) -> str:
         return "5m"
     return step
 
+def _step_to_seconds(step: str) -> int:
+    s = step.strip().lower()
+    if not s:
+        return 300
+    unit = s[-1]
+    try:
+        val = int(s[:-1])
+    except Exception:
+        return 300
+    if unit == "s":
+        return val
+    if unit == "m":
+        return val * 60
+    if unit == "h":
+        return val * 3600
+    if unit == "d":
+        return val * 86400
+    return 300
+
 def _parse_iso_utc(value: str) -> datetime:
     s = value.strip().replace("Z", "+00:00")
     dt = datetime.fromisoformat(s)
@@ -292,6 +314,28 @@ def _render_promql(c: Check, range_str: str) -> str:
     if "{range}" in c.promql:
         return c.promql.replace("{range}", range_str)
     return c.promql
+
+def _apply_target_filter(
+    promql: str,
+    *,
+    server_name: Optional[str],
+    instance: Optional[str],
+) -> str:
+    if not server_name and not instance:
+        return promql
+
+    matchers: List[str] = []
+    on_labels: List[str] = []
+    if instance:
+        matchers.append(f'instance="{instance}"')
+        on_labels.append("instance")
+    if server_name:
+        matchers.append(f'server_name="{server_name}"')
+        on_labels.append("server_name")
+
+    matcher_str = ",".join(matchers)
+    on_str = ",".join(on_labels)
+    return f"({promql}) and on ({on_str}) up{{{matcher_str}}}"
 
 def _prom_headers() -> Dict[str, str]:
     h = {"Accept": "application/json"}
@@ -390,17 +434,89 @@ def _stats_from_values(values: List[List[Any]]) -> Dict[str, Any]:
         "last_ts": last_ts,
     }
 
-def _summarize_matrix(result_matrix: List[Dict[str, Any]], include_samples: bool) -> List[Dict[str, Any]]:
+def _max_sustain_duration(
+    values: List[List[Any]],
+    *,
+    threshold: float,
+    step_seconds: int,
+) -> float:
+    max_dur = 0.0
+    active_start: Optional[float] = None
+    last_ts: Optional[float] = None
+
+    gap_reset = max(1, int(step_seconds * 1.5))
+
+    for ts, v in values:
+        try:
+            t = float(ts)
+            fv = float(v)
+            if not math.isfinite(fv):
+                raise ValueError()
+        except Exception:
+            last_ts = None
+            active_start = None
+            continue
+
+        if last_ts is not None and (t - last_ts) > gap_reset:
+            active_start = None
+
+        if fv >= threshold:
+            if active_start is None:
+                active_start = t
+            dur = t - active_start
+            if dur > max_dur:
+                max_dur = dur
+        else:
+            active_start = None
+
+        last_ts = t
+
+    return max_dur
+
+def _summarize_matrix(
+    result_matrix: List[Dict[str, Any]],
+    include_samples: bool,
+    *,
+    alert_config: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for series in result_matrix:
         metric = series.get("metric", {})
         values = series.get("values", [])
         summary = _stats_from_values(values)
+        if alert_config and summary.get("count", 0) > 0:
+            step_seconds = int(alert_config["step_seconds"])
+            sustain_seconds = int(alert_config["sustain_seconds"])
+            warn_pct = float(alert_config["warn_pct"])
+            crit_pct = float(alert_config["crit_pct"])
+            warn_max = _max_sustain_duration(values, threshold=warn_pct, step_seconds=step_seconds)
+            crit_max = _max_sustain_duration(values, threshold=crit_pct, step_seconds=step_seconds)
+            summary["sustain"] = {
+                "warning": {
+                    "threshold_pct": warn_pct,
+                    "min_duration_sec": sustain_seconds,
+                    "max_duration_sec": warn_max,
+                    "breached": warn_max >= sustain_seconds,
+                },
+                "critical": {
+                    "threshold_pct": crit_pct,
+                    "min_duration_sec": sustain_seconds,
+                    "max_duration_sec": crit_max,
+                    "breached": crit_max >= sustain_seconds,
+                },
+            }
         item = {"metric": metric, "summary": summary}
         if include_samples:
             item["values"] = values
         out.append(item)
     return out
+
+def _should_apply_alerts(c: Optional[Check]) -> bool:
+    if not c:
+        return False
+    if "%" in c.name:
+        return True
+    return c.id.endswith("_pct")
 
 @mcp.tool()
 def list_checks() -> Dict[str, Any]:
@@ -485,6 +601,8 @@ def run_check(
     end_offset_minutes: Optional[int] = None,
     end_offset_hours: Optional[int] = None,
     end_offset_days: Optional[int] = None,
+    server_name: Optional[str] = None,
+    instance: Optional[str] = None,
     environment: Optional[str] = None,
     env_hint: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -494,6 +612,7 @@ def run_check(
     - minutes / hours / days: 기간 길이 지정
     - start_time_utc_iso / end_time_utc_iso: 기간 직접 지정
     - end_offset_*: end(now)에서 과거로 오프셋
+    - server_name / instance: 특정 서버만 필터링
     """
     if check_id not in CHECKS:
         raise ValueError(f"Unknown check_id: {check_id}")
@@ -514,18 +633,30 @@ def run_check(
     )
     range_str = _format_range(end - start)
     promql = _render_promql(c, range_str)
+    promql = _apply_target_filter(promql, server_name=server_name, instance=instance)
+
+    alert_config = None
+    if _should_apply_alerts(c):
+        alert_config = {
+            "warn_pct": ALERT_WARN_PCT,
+            "crit_pct": ALERT_CRIT_PCT,
+            "sustain_seconds": ALERT_SUSTAIN_MINUTES * 60,
+            "step_seconds": _step_to_seconds(step),
+        }
 
     t0 = time.time()
     data = _prom_query_range(prom_url, promql, start=start, end=end, step=step)
     elapsed_ms = int((time.time() - t0) * 1000)
 
     result = data.get("data", {}).get("result", [])
-    summarized = _summarize_matrix(result, include_samples=include_samples)
+    summarized = _summarize_matrix(result, include_samples=include_samples, alert_config=alert_config)
 
     return {
         "check": {"id": c.id, "name": c.name, "description": c.description},
         "environment": env_key,
         "prom_url": prom_url,
+        "filter": {"server_name": server_name, "instance": instance},
+        "alert_config": alert_config,
         "range": {"start": _iso(start), "end": _iso(end), "step": step},
         "series_count": len(summarized),
         "elapsed_ms": elapsed_ms,
@@ -544,10 +675,12 @@ def run_all_checks(
     end_offset_minutes: Optional[int] = None,
     end_offset_hours: Optional[int] = None,
     end_offset_days: Optional[int] = None,
+    server_name: Optional[str] = None,
+    instance: Optional[str] = None,
     environment: Optional[str] = None,
     env_hint: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """모든 체크를 실행해서 한 번에 반환(기본은 요약만)"""
+    """모든 체크를 실행해서 한 번에 반환(기본은 요약만). server_name/instance로 필터 가능."""
     step = _parse_step(step)
     env_key, prom_url = _resolve_prom_url(environment, env_hint)
     start, end = _resolve_time_range(
@@ -566,23 +699,35 @@ def run_all_checks(
     for check_id in CHECKS.keys():
         c = CHECKS[check_id]
         promql = _render_promql(c, range_str)
+        promql = _apply_target_filter(promql, server_name=server_name, instance=instance)
+
+        alert_config = None
+        if _should_apply_alerts(c):
+            alert_config = {
+                "warn_pct": ALERT_WARN_PCT,
+                "crit_pct": ALERT_CRIT_PCT,
+                "sustain_seconds": ALERT_SUSTAIN_MINUTES * 60,
+                "step_seconds": _step_to_seconds(step),
+            }
         t0 = time.time()
         data = _prom_query_range(prom_url, promql, start=start, end=end, step=step)
         elapsed_ms = int((time.time() - t0) * 1000)
 
         result = data.get("data", {}).get("result", [])
-        summarized = _summarize_matrix(result, include_samples=include_samples)
+        summarized = _summarize_matrix(result, include_samples=include_samples, alert_config=alert_config)
 
         out.append({
             "check": {"id": c.id, "name": c.name, "description": c.description},
             "series_count": len(summarized),
             "elapsed_ms": elapsed_ms,
+            "alert_config": alert_config,
             "results": summarized,
         })
 
     return {
         "environment": env_key,
         "prom_url": prom_url,
+        "filter": {"server_name": server_name, "instance": instance},
         "range": {"start": _iso(start), "end": _iso(end), "step": step},
         "checks": out,
     }
@@ -600,8 +745,11 @@ def run_promql(
     end_offset_minutes: Optional[int] = None,
     end_offset_hours: Optional[int] = None,
     end_offset_days: Optional[int] = None,
+    server_name: Optional[str] = None,
+    instance: Optional[str] = None,
     environment: Optional[str] = None,
     env_hint: Optional[str] = None,
+    alert_pct: bool = False,
 ) -> Dict[str, Any]:
     """
     사용자가 제공한 PromQL을 query_range로 실행.
@@ -609,6 +757,7 @@ def run_promql(
     - minutes / hours / days: 기간 길이 지정
     - start_time_utc_iso / end_time_utc_iso: 기간 직접 지정
     - end_offset_*: end(now)에서 과거로 오프셋
+    - server_name / instance: 특정 서버만 필터링
     """
     if not promql or not promql.strip():
         raise ValueError("promql is required")
@@ -627,15 +776,28 @@ def run_promql(
         end_offset_days=end_offset_days,
     )
 
+    filtered_promql = _apply_target_filter(promql.strip(), server_name=server_name, instance=instance)
+
+    alert_config = None
+    if alert_pct:
+        alert_config = {
+            "warn_pct": ALERT_WARN_PCT,
+            "crit_pct": ALERT_CRIT_PCT,
+            "sustain_seconds": ALERT_SUSTAIN_MINUTES * 60,
+            "step_seconds": _step_to_seconds(step),
+        }
+
     t0 = time.time()
-    data = _prom_query_range(prom_url, promql.strip(), start=start, end=end, step=step)
+    data = _prom_query_range(prom_url, filtered_promql, start=start, end=end, step=step)
     elapsed_ms = int((time.time() - t0) * 1000)
 
     result = data.get("data", {}).get("result", [])
-    summarized = _summarize_matrix(result, include_samples=include_samples)
+    summarized = _summarize_matrix(result, include_samples=include_samples, alert_config=alert_config)
 
     return {
         "promql": promql.strip(),
+        "filter": {"server_name": server_name, "instance": instance},
+        "alert_config": alert_config,
         "environment": env_key,
         "prom_url": prom_url,
         "range": {"start": _iso(start), "end": _iso(end), "step": step},
@@ -659,12 +821,16 @@ def run_generated_promql(
     end_offset_minutes: Optional[int] = None,
     end_offset_hours: Optional[int] = None,
     end_offset_days: Optional[int] = None,
+    server_name: Optional[str] = None,
+    instance: Optional[str] = None,
     environment: Optional[str] = None,
     env_hint: Optional[str] = None,
+    alert_pct: bool = False,
 ) -> Dict[str, Any]:
     """
     AI가 생성한 PromQL 실행용 도구. 반드시 사용자의 승인(approved=True)이 필요함.
-    승인 전에는 실행하지 않고 승인 요청 정보를 반환.
+    승인 전에는 실행하지 않고 실행할 PromQL과 승인 요청 정보를 반환.
+    server_name/instance로 특정 서버만 필터링 가능.
     """
     if not promql or not promql.strip():
         raise ValueError("promql is required")
@@ -693,17 +859,30 @@ def run_generated_promql(
         end_offset_days=end_offset_days,
     )
 
+    filtered_promql = _apply_target_filter(promql.strip(), server_name=server_name, instance=instance)
+
+    alert_config = None
+    if alert_pct:
+        alert_config = {
+            "warn_pct": ALERT_WARN_PCT,
+            "crit_pct": ALERT_CRIT_PCT,
+            "sustain_seconds": ALERT_SUSTAIN_MINUTES * 60,
+            "step_seconds": _step_to_seconds(step),
+        }
+
     t0 = time.time()
-    data = _prom_query_range(prom_url, promql.strip(), start=start, end=end, step=step)
+    data = _prom_query_range(prom_url, filtered_promql, start=start, end=end, step=step)
     elapsed_ms = int((time.time() - t0) * 1000)
 
     result = data.get("data", {}).get("result", [])
-    summarized = _summarize_matrix(result, include_samples=include_samples)
+    summarized = _summarize_matrix(result, include_samples=include_samples, alert_config=alert_config)
 
     return {
         "approved": True,
         "question": question.strip(),
         "promql": promql.strip(),
+        "filter": {"server_name": server_name, "instance": instance},
+        "alert_config": alert_config,
         "environment": env_key,
         "prom_url": prom_url,
         "range": {"start": _iso(start), "end": _iso(end), "step": step},

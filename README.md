@@ -113,6 +113,35 @@ uv run python mcp_prometheus.py
 
 ---
 
+## 🎯 특정 서버만 조회하기
+
+`run_check`, `run_all_checks`, `run_promql`, `run_generated_promql`는  
+옵션으로 `server_name` 또는 `instance`를 받아서 특정 서버만 필터링할 수 있습니다.
+
+예시:
+```json
+{"check_id":"cpu_avg_pct","server_name":"CMS AP #1"}
+```
+```json
+{"promql":"up","instance":"10.0.0.12:9100"}
+```
+
+---
+
+## ⏱️ 지속시간 기반 경보 판단
+
+퍼센트(%) 계열 체크는 단일 피크 값이 아닌 **지속시간 기준**으로 경보를 판정합니다.
+
+- Warning: 85% 이상이 **연속 5분 이상** 지속될 때
+- Critical: 95% 이상이 **연속 5분 이상** 지속될 때
+
+필요 시 `.env`에서 아래 값을 조정할 수 있습니다.
+```env
+ALERT_WARN_PCT=85
+ALERT_CRIT_PCT=95
+ALERT_SUSTAIN_MINUTES=5
+```
+
 ## 📌 체크 예시 질문
 
 - “최근 15분 동안 CPU 사용률이 가장 높은 서버는?”
