@@ -1,0 +1,7 @@
+﻿inventories:
+  - id: prod_linux
+    path: /etc/ansible/inventories/prod/hosts.ini
+    description: Production Linux hosts
+  - id: dev_linux
+    path: /etc/ansible/inventories/dev/hosts.ini
+    description: Development Linux hosts

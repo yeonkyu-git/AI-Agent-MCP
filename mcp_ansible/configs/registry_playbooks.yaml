@@ -1,0 +1,7 @@
+﻿playbooks:
+  - id: ping_all
+    path: /opt/ansible/playbooks/ping_all.yml
+    description: Basic connectivity check playbook
+  - id: nginx_hardening
+    path: /opt/ansible/playbooks/nginx_hardening.yml
+    description: Nginx baseline hardening tasks
